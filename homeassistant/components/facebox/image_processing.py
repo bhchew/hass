@@ -1,10 +1,12 @@
 """Component for facial detection and identification via facebox."""
 import base64
 import logging
+import io,os
 
 import requests
 import voluptuous as vol
 
+from PIL import Image, ImageDraw
 from homeassistant.components.image_processing import (
     ATTR_CONFIDENCE,
     CONF_ENTITY_ID,
@@ -25,6 +27,8 @@ from homeassistant.const import (
     HTTP_UNAUTHORIZED,
 )
 from homeassistant.core import split_entity_id
+from homeassistant.helpers import template
+from homeassistant.util.pil import draw_box
 import homeassistant.helpers.config_validation as cv
 
 from .const import DOMAIN, SERVICE_TEACH_FACE
@@ -40,6 +44,7 @@ FACEBOX_NAME = "name"
 CLASSIFIER = "facebox"
 DATA_FACEBOX = "facebox_classifiers"
 FILE_PATH = "file_path"
+CONF_FILE_OUT = "file_out"
 
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
@@ -48,6 +53,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Required(CONF_PORT): cv.port,
         vol.Optional(CONF_USERNAME): cv.string,
         vol.Optional(CONF_PASSWORD): cv.string,
+        vol.Optional(CONF_FILE_OUT, default=[]): vol.All(cv.ensure_list, [cv.template])
     }
 )
 
@@ -211,7 +217,7 @@ class FaceClassifyEntity(ImageProcessingFaceEntity):
     """Perform a face classification."""
 
     def __init__(
-        self, ip_address, port, username, password, hostname, camera_entity, name=None
+        self, hass, ip_address, port, username, password, hostname, camera_entity, config, name=None
     ):
         """Init with the API key and model id."""
         super().__init__()
@@ -220,13 +226,58 @@ class FaceClassifyEntity(ImageProcessingFaceEntity):
         self._username = username
         self._password = password
         self._hostname = hostname
+        self.hass = hass
         self._camera = camera_entity
+        self._file_out = config.get(CONF_FILE_OUT)
         if name:
             self._name = name
         else:
             camera_name = split_entity_id(camera_entity)[1]
             self._name = f"{CLASSIFIER} {camera_name}"
         self._matched = {}
+
+        template.attach(hass, self._file_out)
+
+    def _save_image(self, image, matches, paths):
+        img = Image.open(io.BytesIO(bytearray(image))).convert("RGB")
+        img_width, img_height = img.size
+        draw = ImageDraw.Draw(img)
+
+        # Draw custom global region/area
+        if self._area != [0, 0, 1, 1]:
+            draw_box(
+                draw, self._area, img_width, img_height, "Detection Area", (0, 255, 255)
+            )
+
+        for category, values in matches.items():
+            # Draw custom category regions/areas
+            if category in self._category_areas and self._category_areas[category] != [
+                0,
+                0,
+                1,
+                1,
+            ]:
+                label = "{} Detection Area".format(category.capitalize())
+                draw_box(
+                    draw,
+                    self._category_areas[category],
+                    img_width,
+                    img_height,
+                    label,
+                    (0, 255, 0),
+                )
+
+            # Draw detected objects
+            for instance in values:
+                label = "{0} {1:.1f}%".format(category, instance["score"])
+                draw_box(
+                    draw, instance["box"], img_width, img_height, label, (255, 255, 0)
+                )
+
+        for path in paths:
+            _LOGGER.info("Saving results image to %s", path)
+            img.save(path)
+
 
     def process_image(self, image):
         """Process an image."""
@@ -238,6 +289,18 @@ class FaceClassifyEntity(ImageProcessingFaceEntity):
                 faces = parse_faces(response_json["faces"])
                 self._matched = get_matched_faces(faces)
                 self.process_faces(faces, total_faces)
+
+                if total_faces and self._file_out:
+                    paths = []
+                    for path_template in self._file_out:
+                        if isinstance(path_template, template.Template):
+                            paths.append(
+                                path_template.render(camera_entity=self._camera)
+                            )
+                        else:
+                            paths.append(path_template)
+                    self._save_image(image, faces, paths)
+
 
         else:
             self.total_faces = None
